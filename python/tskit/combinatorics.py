@@ -28,10 +28,132 @@ import collections
 import functools
 import heapq
 import itertools
+import json
+import random
 
+import attr
 import numpy as np
 
 import tskit
+
+
+@attr.s(eq=False)
+class TreeNode:
+    """
+    Simple linked tree class used to generate tree topologies.
+    """
+
+    parent = attr.ib(default=None)
+    children = attr.ib(factory=list)
+    label = attr.ib(default=None)
+
+    @staticmethod
+    def random_binary_tree(leaf_labels, rng):
+        """
+        Returns a random binary tree where the leaves have the specified
+        labels using the specified random.Random instance. The root node
+        of this tree is returned.
+
+        Based on the description of Remy's method of generating "decorated"
+        random binary trees in TAOCP 7.2.1.6. This is not a direct
+        implementation of Algorithm R, because we are interested in
+        the leaf node labellings.
+
+        The pre-fascicle text is available here, page 16:
+        http://www.cs.utsa.edu/~wagner/knuth/fasc4a.pdf
+        """
+        nodes = [TreeNode(label=leaf_labels[0])]
+        for label in leaf_labels[1:]:
+            # Choose a node x randomly and insert a new internal node above
+            # it with the (n + 1)th labelled leaf as its sibling.
+            x = rng.choice(nodes)
+            new_leaf = TreeNode(label=label)
+            new_internal = TreeNode(parent=x.parent, children=[x, new_leaf])
+            if x.parent is not None:
+                index = x.parent.children.index(x)
+                x.parent.children[index] = new_internal
+            rng.shuffle(new_internal.children)
+            x.parent = new_internal
+            new_leaf.parent = new_internal
+            nodes.extend([new_leaf, new_internal])
+
+        root = nodes[0]
+        while root.parent is not None:
+            root = root.parent
+        return root
+
+
+def split_polytomies(
+    tree,
+    *,
+    epsilon=None,
+    method=None,
+    record_provenance=True,
+    random_seed=None,
+):
+    """
+    Return a new tree where extra nodes and edges have been inserted
+    so that any any node with more than two children is resolved into
+    a binary tree.
+
+    For further documentation, please refer to the :meth:`Tree.split_polytomies`
+    method, which is the usual route through which this function is called.
+    """
+    allowed_methods = ["random"]
+    if epsilon is None:
+        epsilon = 1e-10
+    if method is None:
+        method = "random"
+    if method not in allowed_methods:
+        raise ValueError(f"Method must be chosen from {allowed_methods}")
+
+    tables = tree.tree_sequence.dump_tables()
+    tables.keep_intervals([tree.interval], simplify=False)
+    tables.edges.clear()
+    rng = random.Random(random_seed)
+
+    for u in tree.nodes():
+        if tree.num_children(u) > 2:
+            root = TreeNode.random_binary_tree(tree.children(u), rng)
+            root.label = u
+            time = tree.time(u) - epsilon
+            stack = [(child, time) for child in root.children]
+            while len(stack) > 0:
+                node, time = stack.pop()
+                if node.label is None:
+                    node.label = tables.nodes.add_row(time=time)
+                tables.edges.add_row(*tree.interval, node.parent.label, node.label)
+                for child in node.children:
+                    stack.append((child, time - epsilon))
+        else:
+            for v in tree.children(u):
+                tables.edges.add_row(*tree.interval, u, v)
+
+    if record_provenance:
+        parameters = {"command": "split_polytomies"}
+        tables.provenances.add_row(
+            record=json.dumps(tskit.provenance.get_provenance_dict(parameters))
+        )
+    try:
+        tables.sort()
+        ts = tables.tree_sequence()
+    except tskit.LibraryError as e:
+        msg = str(e)
+        if msg.startswith(
+            "A mutation's time must be < the parent node of the edge on which it occurs"
+        ):
+            e.args += (
+                f"Epsilon={epsilon} not small enough to create new nodes below a "
+                "polytomy, due to the time of a mutation above a child of the polytomy.",
+            )
+        elif msg.startswith("time[parent] must be greater than time[child]"):
+            e.args += (
+                f"Epsilon={epsilon} not small enough to create new nodes below a "
+                "polytomy, due to the time of one of child nodes being too close. ",
+            )
+
+        raise e
+    return ts.at(tree.interval[0])
 
 
 def treeseq_count_topologies(ts, sample_sets):
@@ -147,7 +269,7 @@ class TopologyCounter:
 
     @staticmethod
     def _to_key(sample_set_indexes):
-        if not isinstance(sample_set_indexes, collections.Iterable):
+        if not isinstance(sample_set_indexes, collections.abc.Iterable):
             sample_set_indexes = (sample_set_indexes,)
         return tuple(sorted(sample_set_indexes))
 
@@ -249,13 +371,13 @@ class PartialTopologyCounter:
         children = []
         for sample_set_indexes, rank in child_topologies:
             n = len(sample_set_indexes)
-            t = RankTree.unrank(rank, n, list(sample_set_indexes))
+            t = RankTree.unrank(n, rank, list(sample_set_indexes))
             children.append(t)
         children.sort(key=RankTree.canonical_order)
         return RankTree(children).rank()
 
 
-def all_trees(num_leaves):
+def all_trees(num_leaves, span=1):
     """
     Generates all unique leaf-labelled trees with ``num_leaves``
     leaves. See :ref:`sec_combinatorics` on the details of this
@@ -264,25 +386,27 @@ def all_trees(num_leaves):
     chosen arbitrarily.
 
     :param int num_leaves: The number of leaves of the tree to generate.
+    :param float span: The genomic span of each returned tree.
     :rtype: tskit.Tree
     """
     for rank_tree in RankTree.all_labelled_trees(num_leaves):
-        yield rank_tree.to_tsk_tree()
+        yield rank_tree.to_tsk_tree(span=span)
 
 
-def all_tree_shapes(num_leaves):
+def all_tree_shapes(num_leaves, span=1):
     """
     Generates all unique shapes of trees with ``num_leaves`` leaves.
 
     :param int num_leaves: The number of leaves of the tree to generate.
+    :param float span: The genomic span of each returned tree.
     :rtype: tskit.Tree
     """
     for rank_tree in RankTree.all_unlabelled_trees(num_leaves):
         default_labelling = rank_tree.label_unrank(0)
-        yield default_labelling.to_tsk_tree()
+        yield default_labelling.to_tsk_tree(span=span)
 
 
-def all_tree_labellings(tree):
+def all_tree_labellings(tree, span=1):
     """
     Generates all unique labellings of the leaves of a
     :class:`tskit.Tree`. Leaves are labelled from the set
@@ -290,11 +414,12 @@ def all_tree_labellings(tree):
 
     :param tskit.Tree tree: The tree used to generate
         labelled trees of the same shape.
+    :param float span: The genomic span of each returned tree.
     :rtype: tskit.Tree
     """
     rank_tree = RankTree.from_tsk_tree(tree)
     for labelling in RankTree.all_labellings(rank_tree):
-        yield labelling.to_tsk_tree()
+        yield labelling.to_tsk_tree(span=span)
 
 
 class RankTree:
@@ -429,7 +554,7 @@ class RankTree:
         return self._label_rank
 
     @staticmethod
-    def unrank(rank, num_leaves, labels=None):
+    def unrank(num_leaves, rank, labels=None):
         """
         Produce a ``RankTree`` of the given ``rank`` with ``num_leaves`` leaves,
         labelled with ``labels``. Labels must be sorted, and if ``None`` default
@@ -438,18 +563,18 @@ class RankTree:
         shape_rank, label_rank = rank
         if shape_rank < 0 or label_rank < 0:
             raise ValueError("Rank is out of bounds.")
-        unlabelled = RankTree.shape_unrank(shape_rank, num_leaves)
+        unlabelled = RankTree.shape_unrank(num_leaves, shape_rank)
         return unlabelled.label_unrank(label_rank, labels)
 
     @staticmethod
-    def shape_unrank(shape_rank, n):
+    def shape_unrank(n, shape_rank):
         """
         Generate an unlabelled tree with n leaves with a shape corresponding to
         the `shape_rank`.
         """
         part, child_shape_ranks = children_shape_ranks(shape_rank, n)
         children = [
-            RankTree.shape_unrank(rk, k) for rk, k in zip(child_shape_ranks, part)
+            RankTree.shape_unrank(k, rk) for k, rk in zip(part, child_shape_ranks)
         ]
 
         t = RankTree(children=children)
@@ -515,12 +640,19 @@ class RankTree:
 
         return RankTree.from_tsk_tree_node(tree, tree.root)
 
-    def to_tsk_tree(self):
+    def to_tsk_tree(self, span=1):
+        """
+        Convert a ``RankTree`` into the only tree in a new tree sequence.
+
+        :param float span: The genomic span of the returned tree. The tree will cover
+            the interval :math:`[0, span)` and the :attr:`~Tree.tree_sequence` from which
+            the tree is taken will have its :attr:`~tskit.TreeSequence.sequence_length`
+            equal to ``span``.
+        """
         if set(self.labels) != set(range(self.num_leaves)):
             raise ValueError("Labels set must be equivalent to [0, num_leaves)")
 
-        seq_length = 1
-        tables = tskit.TableCollection(seq_length)
+        tables = tskit.TableCollection(span)
 
         def add_node(node):
             if node.is_leaf():
@@ -532,7 +664,7 @@ class RankTree:
             max_child_time = max(tables.nodes.time[c] for c in child_ids)
             parent_id = tables.nodes.add_row(time=max_child_time + 1)
             for child_id in child_ids:
-                tables.edges.add_row(0, seq_length, parent_id, child_id)
+                tables.edges.add_row(0, span, parent_id, child_id)
 
             return parent_id
 
@@ -743,8 +875,8 @@ def num_tree_pairings(part):
     return total
 
 
-def num_labellings(shape_rk, n):
-    return RankTree.shape_unrank(shape_rk, n).num_labellings()
+def num_labellings(n, shape_rk):
+    return RankTree.shape_unrank(n, shape_rk).num_labellings()
 
 
 def children_shape_ranks(rank, n):

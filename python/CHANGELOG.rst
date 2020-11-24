@@ -1,8 +1,82 @@
 --------------------
-[X.X.X] - XXXX-XX-XX
+[0.X.X] - 2020-XX-XX
+--------------------
+
+**Features**
+
+- Expose ``TreeSequence.coiterate()`` method to allow iteration over 2 sequences
+  simultaneously, aiding comparison of trees from two sequences.
+  (:user:`jeromekelleher`, :user:`hyanwong`, :issue:`1021`, :pr:`1022`)
+
+- tskit is now supported on, and has wheels for, python3.9.
+  (:user:`benjeffery`, :issue:`982`, :pr:`907`)
+
+- ``Tree.newick()`` now has extra option ``include_branch_lengths`` to allow branch
+  lengths to be omitted (:user:`hyanwong`, :pr:`931`).
+
+- Added ``Tree.generate_star`` static method to create star-topologies (:user:`hyanwong`,
+  :pr:`934`).
+
+- Added ``equals`` method to TreeSequence, TableCollection and each of the tables which
+  provides more flexible equality comparisons, for example, allowing
+  users to ignore metadata or provenance in the comparison.
+  (:user:`mufernando`, :user:`jeromekelleher`, :issue:`896`, :pr:`897`,
+  :issue:`913`, :pr:`917`).
+
+- Added ``__eq__`` to TreeSequence.
+  (:user:`benjeffery`, :issue:`1011`, :pr:`1020`)
+
+- ``ts.dump`` and ``tskit.load`` now support reading and writing file objects such as
+  FIFOs and sockets. (:user:`benjeffery`, :issue:`657`, :pr:`909`)
+
+- Added ``tskit.write_ms`` for writing to MS format.
+  (:user:`saurabhbelsare`, :issue:`727`, :pr:`854`)
+
+- Added ``TableCollection.indexes`` for access to the edge insertion/removal order indexes.
+  (:user:`benjeffery`, :issue:`4`, :pr:`916`)
+
+- The dictionary representation of a TableCollection now contains its index.
+  (:user:`benjeffery`, :issue:`870`, :pr:`921`)
+
+- Added ``TreeSequence._repr_html_`` for use in jupyter notebooks.
+  (:user:`benjeffery`, :issue:`872`, :pr:`923`)
+
+- Added ``TreeSequence.__repr__`` to display a summary for terminal usage.
+  (:user:`benjeffery`, :issue:`938`, :pr:`985`)
+
+- Added ``TableCollection.dump`` and ``TableCollection.load``. This allows table
+  collections that are not valid tree sequences to be manipulated.
+  (:user:`benjeffery`, :issue:`14`, :pr:`986`)
+
+- Added ``nbytes`` method to tables, ``TableCollection`` and ``TreeSequence`` which
+  reports the size in bytes of those objects.
+  (:user:`jeromekelleher`, :user:`benjeffery`, :issue:`54`, :pr:`871`)
+
+- Added ``TableCollection.clear`` to clear data table rows and optionally
+  provenances, table schemas and tree-sequence level metadata and schema.
+  (:user:`benjeffery`, :issue:`929`, :pr:`1001`)
+
+**Bugfixes**
+
+- ``LightWeightTableCollection.asdict`` and ``TableCollection.asdict`` now return copies
+  of arrays.
+  (:user:`benjeffery`, :issue:`1025`, :pr:`1029`)
+
+**Breaking changes**
+
+- The argument to ``ts.dump`` and ``tskit.load`` has been renamed `file` from `path`.
+- All arguments to ``Tree.newick()`` except precision are now keyword-only.
+- Renamed ``ts.trait_regression`` to ``ts.trait_linear_model``.
+
+--------------------
+[0.3.2] - 2020-09-29
 --------------------
 
 **Breaking changes**
+
+- The argument order of ``Tree.unrank`` and ``combinatorics.num_labellings`` now
+  positions the number of leaves before the tree rank
+  (:user:`daniel-goldstein`, :issue:`950`, :pr:`978`)
 
 - Change several methods (``simplify()``, ``trees()``, ``Tree()``) so most parameters
   are keyword only, not positional. This allows reordering of parameters, so
@@ -12,6 +86,9 @@
 
 
 **Features**
+
+- Add ``split_polytomies`` method to the Tree class
+  (:user:`hyanwong`, :user:`jeromekelleher`, :issue:`809`, :pr:`815`)
 
 - Tree accessor functions (e.g. ``ts.first()``, ``ts.at()`` pass extra parameters such as
   ``sample_indexes`` to the underlying ``Tree`` constructor; also ``root_threshold`` can
