@@ -432,6 +432,23 @@ class TestTableMethodsErrors:
             with pytest.raises(TypeError):
                 ll_table.get_row(no_such_arg="")
 
+    @pytest.mark.parametrize("table", ["nodes", "individuals"])
+    def test_flag_underflow_overflow(self, table):
+        tables = _tskit.TableCollection(1)
+        table = getattr(tables, table)
+        table.add_row(flags=0)
+        table.add_row(flags=(1 << 32) - 1)
+        with pytest.raises(OverflowError, match="unsigned int32 >= than 2\\^32"):
+            table.add_row(flags=1 << 32)
+        with pytest.raises(OverflowError, match="int too big to convert"):
+            table.add_row(flags=1 << 64)
+        with pytest.raises(OverflowError, match="int too big to convert"):
+            table.add_row(flags=1 << 256)
+        with pytest.raises(
+            ValueError, match="Can't convert negative value to unsigned int"
+        ):
+            table.add_row(flags=-1)
+
     def test_index(self):
         tc = msprime.simulate(10, random_seed=42).tables._ll_tables
         assert tc.indexes["edge_insertion_order"].dtype == np.int32
@@ -1752,9 +1769,10 @@ class TestLdCalculator(LowLevelTestCase):
             calc.get_r2_array(buff, 0, max_distance=-1)
         with pytest.raises(ValueError):
             calc.get_r2_array(buff, 0, direction=1000)
+
         # TODO this API is poor, we should explicitly catch these negative
         # size errors.
-        for bad_max_mutations in [-2, -3, -(2 ** 32)]:
+        for bad_max_mutations in [-2, -3]:
             with pytest.raises(BufferError):
                 calc.get_r2_array(buff, 0, max_mutations=bad_max_mutations)
         for bad_start_pos in [-1, n, n + 1]:
@@ -2601,7 +2619,7 @@ class TestModuleFunctions:
 
     def test_tskit_version(self):
         version = _tskit.get_tskit_version()
-        assert version == (0, 99, 8)
+        assert version == (0, 99, 9)
 
 
 def test_uninitialised():

@@ -492,7 +492,7 @@ class HighLevelTestCase:
             next(iter2)
         assert ts.get_num_trees() == num_trees
         assert breakpoints == list(ts.breakpoints())
-        assert length == ts.get_sequence_length()
+        assert length == pytest.approx(ts.get_sequence_length())
 
 
 class TestNumpySamples:
@@ -1288,6 +1288,16 @@ class TestTreeSequence(HighLevelTestCase):
                 with pytest.raises(TypeError):
                     func(bad_filename)
 
+    def test_zlib_compression_warning(self, ts_fixture, tmp_path):
+        temp_file = tmp_path / "tmp.trees"
+        with warnings.catch_warnings(record=True) as w:
+            ts_fixture.dump(temp_file, zlib_compression=True)
+            assert len(w) == 1
+            assert issubclass(w[0].category, RuntimeWarning)
+        with warnings.catch_warnings(record=True) as w:
+            ts_fixture.dump(temp_file, zlib_compression=False)
+            assert len(w) == 0
+
     def test_tables_sequence_length_round_trip(self):
         for sequence_length in [0.1, 1, 10, 100]:
             ts = msprime.simulate(5, length=sequence_length, random_seed=1)
@@ -1456,9 +1466,9 @@ class TestTreeSequence(HighLevelTestCase):
             for table in ts.tables.name_map:
                 assert f"<td>{table.capitalize()}</td>" in html
 
-    def test_repr(self):
+    def test_str(self):
         for ts in get_example_tree_sequences():
-            s = repr(ts)
+            s = str(ts)
             assert len(s) > 999
             assert re.search(rf"║Trees *│ *{ts.num_trees}║", s)
             for table in ts.tables.name_map:
@@ -1631,10 +1641,10 @@ class TestTreeSequenceMetadata:
     def test_tree_sequence_metadata_schema(self):
         tc = tskit.TableCollection(1)
         ts = tc.tree_sequence()
-        assert str(ts.metadata_schema) == str(tskit.MetadataSchema(None))
+        assert repr(ts.metadata_schema) == repr(tskit.MetadataSchema(None))
         tc.metadata_schema = self.metadata_schema
         ts = tc.tree_sequence()
-        assert str(ts.metadata_schema) == str(self.metadata_schema)
+        assert repr(ts.metadata_schema) == repr(self.metadata_schema)
         with pytest.raises(AttributeError):
             del ts.metadata_schema
         with pytest.raises(AttributeError):
@@ -1666,17 +1676,19 @@ class TestTreeSequenceMetadata:
             schema = tskit.MetadataSchema({"codec": "json", "TEST": f"{table}-SCHEMA"})
             # Check via table API
             getattr(tables, f"{table}s").metadata_schema = schema
-            assert str(getattr(tables, f"{table}s").metadata_schema) == str(schema)
-            for other_table in self.metadata_tables:
-                if other_table != table:
-                    assert str(getattr(tables, f"{other_table}s").metadata_schema) == ""
-            # Check via tree-sequence API
-            new_ts = tskit.TreeSequence.load_tables(tables)
-            assert str(getattr(new_ts.table_metadata_schemas, table)) == str(schema)
+            assert repr(getattr(tables, f"{table}s").metadata_schema) == repr(schema)
             for other_table in self.metadata_tables:
                 if other_table != table:
                     assert (
-                        str(getattr(new_ts.table_metadata_schemas, other_table)) == ""
+                        repr(getattr(tables, f"{other_table}s").metadata_schema) == ""
+                    )
+            # Check via tree-sequence API
+            new_ts = tskit.TreeSequence.load_tables(tables)
+            assert repr(getattr(new_ts.table_metadata_schemas, table)) == repr(schema)
+            for other_table in self.metadata_tables:
+                if other_table != table:
+                    assert (
+                        repr(getattr(new_ts.table_metadata_schemas, other_table)) == ""
                     )
             # Can't set schema via this API
             with pytest.raises(AttributeError):
