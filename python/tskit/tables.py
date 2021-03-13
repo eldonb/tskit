@@ -45,11 +45,11 @@ from tskit import UNKNOWN_TIME
 attr_options = {"slots": True, "frozen": True, "auto_attribs": True}
 
 
-# note: soon attrs will deprecate cmp; we just need to change this argument to eq
-@attr.s(cmp=False, **attr_options)
+@attr.s(eq=False, **attr_options)
 class IndividualTableRow:
     flags: int
     location: np.ndarray
+    parents: np.ndarray
     metadata: bytes
 
     def __eq__(self, other):
@@ -60,6 +60,7 @@ class IndividualTableRow:
                 (
                     self.flags == other.flags,
                     np.array_equal(self.location, other.location),
+                    np.array_equal(self.parents, other.parents),
                     self.metadata == other.metadata,
                 )
             )
@@ -141,6 +142,19 @@ class ProvenanceTableRow:
     record: str
 
 
+@attr.s(**attr_options)
+class TableCollectionIndexes:
+    edge_insertion_order: np.ndarray = attr.ib(default=None)
+    edge_removal_order: np.ndarray = attr.ib(default=None)
+
+    def asdict(self):
+        return attr.asdict(self, filter=lambda k, v: v is not None)
+
+    @property
+    def nbytes(self):
+        return self.edge_insertion_order.nbytes + self.edge_removal_order.nbytes
+
+
 def keep_with_offset(keep, data, offset):
     """
     Used when filtering _offset columns in tables
@@ -188,14 +202,50 @@ class BaseTable:
     def max_rows_increment(self):
         return self.ll_table.max_rows_increment
 
-    def __eq__(self, other):
+    @property
+    def nbytes(self) -> int:
+        """
+        Returns the total number of bytes required to store the data
+        in this table. Note that this may not be equal to
+        the actual memory footprint.
+        """
+        # It's not ideal that we run asdict() here to do this as we're
+        # currently creating copies of the column arrays, so it would
+        # be more efficient to have dedicated low-level methods. However,
+        # if we do have read-only views on the underlying memory for the
+        # column arrays then this will be a perfectly good way of
+        # computing the nbytes values and the overhead minimal.
+        d = self.asdict()
+        nbytes = 0
+        # Some tables don't have a metadata_schema
+        metadata_schema = d.pop("metadata_schema", None)
+        if metadata_schema is not None:
+            nbytes += len(metadata_schema.encode())
+        nbytes += sum(col.nbytes for col in d.values())
+        return nbytes
+
+    def equals(self, other, ignore_metadata=False):
+        """
+        Returns True if  `self` and `other` are equal. By default, two tables
+        are considered equal if their columns and metadata schemas are
+        byte-for-byte identical.
+
+        :param other: Another table instance
+        :param bool ignore_metadata: If True exclude metadata and metadata schemas
+            from the comparison.
+        :return: True if other is equal to this table; False otherwise.
+        :rtype: bool
+        """
+        # Note: most tables support ignore_metadata, we can override for those that don't
         ret = False
         if type(other) is type(self):
-            ret = bool(self.ll_table.equals(other.ll_table))
+            ret = bool(
+                self.ll_table.equals(other.ll_table, ignore_metadata=ignore_metadata)
+            )
         return ret
 
-    def __ne__(self, other):
-        return not self.__eq__(other)
+    def __eq__(self, other):
+        return self.equals(other)
 
     def __len__(self):
         return self.num_rows
@@ -278,7 +328,7 @@ class BaseTable:
         ret = {col: getattr(self, col) for col in self.column_names}
         # Not all tables have metadata
         try:
-            ret["metadata_schema"] = str(self.metadata_schema)
+            ret["metadata_schema"] = repr(self.metadata_schema)
         except AttributeError:
             pass
         return ret
@@ -313,7 +363,8 @@ class BaseTable:
                 <style scoped="">
                     .tskit-table tbody tr th:only-of-type {{vertical-align: middle;}}
                     .tskit-table tbody tr th {{vertical-align: top;}}
-                    .tskit-table tbody td {{text-align: right;}}
+                    .tskit-table tbody td {{text-align: right;padding: 0.5em 0.5em;}}
+                    .tskit-table tbody th {{padding: 0.5em 0.5em;}}
                 </style>
                 <table border="1" class="tskit-table">
                     <thead>
@@ -363,7 +414,12 @@ class MetadataMixin:
 
     @metadata_schema.setter
     def metadata_schema(self, schema: metadata.MetadataSchema) -> None:
-        self.ll_table.metadata_schema = str(schema)
+        if not isinstance(schema, metadata.MetadataSchema):
+            raise TypeError(
+                "Only instances of tskit.MetadataSchema can be assigned to "
+                f"metadata_schema, not {type(schema)}"
+            )
+        self.ll_table.metadata_schema = repr(schema)
         self._update_metadata_schema_cache_from_ll()
 
     def decode_row(self, row: Tuple[Any]) -> Tuple:
@@ -401,6 +457,12 @@ class IndividualTable(BaseTable, MetadataMixin):
     :ivar location_offset: The array of offsets into the location column. See
         :ref:`sec_encoding_ragged_columns` for more details.
     :vartype location_offset: numpy.ndarray, dtype=np.uint32
+    :ivar parents: The flattened array of parent individual ids. See
+        :ref:`sec_encoding_ragged_columns` for more details.
+    :vartype parents: numpy.ndarray, dtype=np.int32
+    :ivar parents_offset: The array of offsets into the parents column. See
+        :ref:`sec_encoding_ragged_columns` for more details.
+    :vartype parents_offset: numpy.ndarray, dtype=np.uint32
     :ivar metadata: The flattened array of binary metadata values. See
         :ref:`sec_tables_api_binary_columns` for more details.
     :vartype metadata: numpy.ndarray, dtype=np.int8
@@ -415,6 +477,8 @@ class IndividualTable(BaseTable, MetadataMixin):
         "flags",
         "location",
         "location_offset",
+        "parents",
+        "parents_offset",
         "metadata",
         "metadata_offset",
     ]
@@ -427,8 +491,9 @@ class IndividualTable(BaseTable, MetadataMixin):
     def _text_header_and_rows(self, limit=None):
         flags = self.flags
         location = util.unpack_arrays(self.location, self.location_offset)
+        parents = util.unpack_arrays(self.parents, self.parents_offset)
         metadata = util.unpack_bytes(self.metadata, self.metadata_offset)
-        headers = ("id", "flags", "location", "metadata")
+        headers = ("id", "flags", "location", "parents", "metadata")
         rows = []
         if limit is None or self.num_rows <= limit:
             indexes = range(self.num_rows)
@@ -444,12 +509,15 @@ class IndividualTable(BaseTable, MetadataMixin):
             else:
                 md = base64.b64encode(metadata[j]).decode("utf8")
                 location_str = ",".join(map(str, location[j]))
+                parents_str = ",".join(map(str, parents[j]))
                 rows.append(
-                    "{}\t{}\t{}\t{}".format(j, flags[j], location_str, md).split("\t")
+                    "{}\t{}\t{}\t{}\t{}".format(
+                        j, flags[j], location_str, parents_str, md
+                    ).split("\t")
                 )
         return headers, rows
 
-    def add_row(self, flags=0, location=None, metadata=None):
+    def add_row(self, flags=0, location=None, parents=None, metadata=None):
         """
         Adds a new row to this :class:`IndividualTable` and returns the ID of the
         corresponding individual. Metadata, if specified, will be validated and encoded
@@ -460,18 +528,28 @@ class IndividualTable(BaseTable, MetadataMixin):
         :param array-like location: A list of numeric values or one-dimensional numpy
             array describing the location of this individual. If not specified
             or None, a zero-dimensional location is stored.
+        :param array-like parents: A list or array of ids of parent individuals. If not
+            specified an empty array is stored.
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added node.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
-        return self.ll_table.add_row(flags=flags, location=location, metadata=metadata)
+        return self.ll_table.add_row(
+            flags=flags, location=location, parents=parents, metadata=metadata
+        )
 
     def set_columns(
         self,
         flags=None,
         location=None,
         location_offset=None,
+        parents=None,
+        parents_offset=None,
         metadata=None,
         metadata_offset=None,
         metadata_schema=None,
@@ -484,6 +562,8 @@ class IndividualTable(BaseTable, MetadataMixin):
         The ``flags`` array is mandatory and defines the number of individuals
         the table will contain.
         The ``location`` and ``location_offset`` parameters must be supplied
+        together, and meet the requirements for :ref:`sec_encoding_ragged_columns`.
+        The ``parents`` and ``parents_offset`` parameters must be supplied
         together, and meet the requirements for :ref:`sec_encoding_ragged_columns`.
         The ``metadata`` and ``metadata_offset`` parameters must be supplied
         together, and meet the requirements for :ref:`sec_encoding_ragged_columns`.
@@ -498,6 +578,12 @@ class IndividualTable(BaseTable, MetadataMixin):
         :type location: numpy.ndarray, dtype=np.float64
         :param location_offset: The offsets into the ``location`` array.
         :type location_offset: numpy.ndarray, dtype=np.uint32.
+        :param parents: The flattened parents array. Must be specified along
+            with ``parents_offset``. If not specified or None, an empty parents array
+            is stored for each individual.
+        :type parents: numpy.ndarray, dtype=np.int32
+        :param parents_offset: The offsets into the ``parents`` array.
+        :type parents_offset: numpy.ndarray, dtype=np.uint32.
         :param metadata: The flattened metadata array. Must be specified along
             with ``metadata_offset``. If not specified or None, an empty metadata
             value is stored for each individual.
@@ -512,6 +598,8 @@ class IndividualTable(BaseTable, MetadataMixin):
                 flags=flags,
                 location=location,
                 location_offset=location_offset,
+                parents=parents,
+                parents_offset=parents_offset,
                 metadata=metadata,
                 metadata_offset=metadata_offset,
                 metadata_schema=metadata_schema,
@@ -523,6 +611,8 @@ class IndividualTable(BaseTable, MetadataMixin):
         flags=None,
         location=None,
         location_offset=None,
+        parents=None,
+        parents_offset=None,
         metadata=None,
         metadata_offset=None,
     ):
@@ -532,6 +622,8 @@ class IndividualTable(BaseTable, MetadataMixin):
 
         The ``flags`` array is mandatory and defines the number of
         extra individuals to add to the table.
+        The ``parents`` and ``parents_offset`` parameters must be supplied
+        together, and meet the requirements for :ref:`sec_encoding_ragged_columns`.
         The ``location`` and ``location_offset`` parameters must be supplied
         together, and meet the requirements for :ref:`sec_encoding_ragged_columns`.
         The ``metadata`` and ``metadata_offset`` parameters must be supplied
@@ -550,6 +642,11 @@ class IndividualTable(BaseTable, MetadataMixin):
         :param metadata: The flattened metadata array. Must be specified along
             with ``metadata_offset``. If not specified or None, an empty metadata
             value is stored for each individual.
+        :param parents: The flattened parents array. Must be specified along
+            with ``parents_offset``. If not specified or None, an empty parents array
+            is stored for each individual.
+        :type parents: numpy.ndarray, dtype=np.int32
+        :param parents_offset: The offsets into the ``parents`` array.
         :type metadata: numpy.ndarray, dtype=np.int8
         :param metadata_offset: The offsets into the ``metadata`` array.
         :type metadata_offset: numpy.ndarray, dtype=np.uint32.
@@ -560,6 +657,8 @@ class IndividualTable(BaseTable, MetadataMixin):
                 flags=flags,
                 location=location,
                 location_offset=location_offset,
+                parents=parents,
+                parents_offset=parents_offset,
                 metadata=metadata,
                 metadata_offset=metadata_offset,
             )
@@ -578,6 +677,21 @@ class IndividualTable(BaseTable, MetadataMixin):
         d = self.asdict()
         d["location"] = packed
         d["location_offset"] = offset
+        self.set_columns(**d)
+
+    def packset_parents(self, parents):
+        """
+        Packs the specified list of parent values and updates the ``parent``
+        and ``parent_offset`` columns. The length of the parents array
+        must be equal to the number of rows in the table.
+
+        :param list parents: A list of list of parent ids, interpreted as numpy int32
+            arrays.
+        """
+        packed, offset = util.pack_arrays(parents, np.int32)
+        d = self.asdict()
+        d["parents"] = packed
+        d["parents_offset"] = offset
         self.set_columns(**d)
 
 
@@ -669,9 +783,13 @@ class NodeTable(BaseTable, MetadataMixin):
         :param int individual: The ID of the individual in which the new node was born.
             Defaults to :data:`tskit.NULL`.
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added node.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
         return self.ll_table.add_row(flags, time, population, individual, metadata)
 
@@ -864,9 +982,13 @@ class EdgeTable(BaseTable, MetadataMixin):
         :param int parent: The ID of parent node.
         :param int child: The ID of child node.
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added edge.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
         return self.ll_table.add_row(left, right, parent, child, metadata)
 
@@ -1078,9 +1200,13 @@ class MigrationTable(BaseTable, MetadataMixin):
         :param int dest: The ID of the destination population.
         :param float time: The time of the migration event.
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added migration.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
         return self.ll_table.add_row(left, right, node, source, dest, time, metadata)
 
@@ -1285,9 +1411,13 @@ class SiteTable(BaseTable, MetadataMixin):
         :param float position: The position of this site in genome coordinates.
         :param str ancestral_state: The state of this site at the root of the tree.
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added site.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
         return self.ll_table.add_row(position, ancestral_state, metadata)
 
@@ -1511,11 +1641,15 @@ class MutationTable(BaseTable, MetadataMixin):
         :param int parent: The ID of the parent mutation. If not specified,
             defaults to :attr:`NULL`.
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added mutation.
         :param float time: The occurrence time for the new mutation. If not specified,
             defaults to ``UNKNOWN_TIME``, indicating the time is unknown.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
         return self.ll_table.add_row(
             site,
@@ -1714,9 +1848,13 @@ class PopulationTable(BaseTable, MetadataMixin):
         :attr:`metadata_schema<tskit.PopulationTable.metadata_schema>`.
 
         :param object metadata: Any object that is valid metadata for the table's schema.
+            Defaults to the default metadata value for the table's schema. This is
+            typically ``{}``. For no schema, ``None``.
         :return: The ID of the newly added population.
         :rtype: int
         """
+        if metadata is None:
+            metadata = self.metadata_schema.empty_value
         metadata = self.metadata_schema.validate_and_encode_row(metadata)
         return self.ll_table.add_row(metadata=metadata)
 
@@ -1822,6 +1960,26 @@ class ProvenanceTable(BaseTable):
         if ll_table is None:
             ll_table = _tskit.ProvenanceTable(max_rows_increment=max_rows_increment)
         super().__init__(ll_table, ProvenanceTableRow)
+
+    def equals(self, other, ignore_timestamps=False):
+        """
+        Returns True if  `self` and `other` are equal. By default, two provenance
+        tables are considered equal if their columns are byte-for-byte identical.
+
+        :param other: Another provenance table instance
+        :param bool ignore_timestamps: If True exclude the timestamp column
+            from the comparison.
+        :return: True if other is equal to this provenance table; False otherwise.
+        :rtype: bool
+        """
+        ret = False
+        if type(other) is type(self):
+            ret = bool(
+                self.ll_table.equals(
+                    other.ll_table, ignore_timestamps=ignore_timestamps
+                )
+            )
+        return ret
 
     def add_row(self, record, timestamp=None):
         """
@@ -1992,6 +2150,7 @@ class TableCollection:
     :vartype populations: PopulationTable
     :ivar provenances: The provenance table.
     :vartype provenances: ProvenanceTable
+    :ivar index: The edge insertion and removal index.
     :ivar sequence_length: The sequence length defining the coordinate
         space.
     :vartype sequence_length: float
@@ -2036,6 +2195,15 @@ class TableCollection:
         return ProvenanceTable(ll_table=self._ll_tables.provenances)
 
     @property
+    def indexes(self):
+        indexes = self._ll_tables.indexes
+        return TableCollectionIndexes(**indexes)
+
+    @indexes.setter
+    def indexes(self, indexes):
+        self._ll_tables.indexes = indexes.asdict()
+
+    @property
     def sequence_length(self):
         return self._ll_tables.sequence_length
 
@@ -2057,8 +2225,8 @@ class TableCollection:
     @metadata_schema.setter
     def metadata_schema(self, schema: metadata.MetadataSchema) -> None:
         # Check the schema is a valid schema instance by roundtripping it.
-        metadata.parse_metadata_schema(str(schema))
-        self._ll_tables.metadata_schema = str(schema)
+        metadata.parse_metadata_schema(repr(schema))
+        self._ll_tables.metadata_schema = repr(schema)
 
     @property
     def metadata(self) -> Any:
@@ -2087,10 +2255,10 @@ class TableCollection:
         Note: the semantics of this method changed at tskit 0.1.0. Previously a
         map of table names to the tables themselves was returned.
         """
-        return {
-            "encoding_version": (1, 1),
+        ret = {
+            "encoding_version": (1, 3),
             "sequence_length": self.sequence_length,
-            "metadata_schema": str(self.metadata_schema),
+            "metadata_schema": repr(self.metadata_schema),
             "metadata": self.metadata_schema.encode_row(self.metadata),
             "individuals": self.individuals.asdict(),
             "nodes": self.nodes.asdict(),
@@ -2100,7 +2268,9 @@ class TableCollection:
             "mutations": self.mutations.asdict(),
             "populations": self.populations.asdict(),
             "provenances": self.provenances.asdict(),
+            "indexes": self.indexes.asdict(),
         }
+        return ret
 
     @property
     def name_map(self):
@@ -2119,6 +2289,23 @@ class TableCollection:
             "provenances": self.provenances,
             "sites": self.sites,
         }
+
+    @property
+    def nbytes(self) -> int:
+        """
+        Returns the total number of bytes required to store the data
+        in this table collection. Note that this may not be equal to
+        the actual memory footprint.
+        """
+        return sum(
+            (
+                8,  # sequence_length takes 8 bytes
+                len(self.metadata_bytes),
+                len(repr(self.metadata_schema).encode()),
+                self.indexes.nbytes,
+                sum(table.nbytes for table in self.name_map.values()),
+            )
+        )
 
     def __banner(self, title):
         width = 60
@@ -2147,17 +2334,85 @@ class TableCollection:
         s += str(self.provenances)
         return s
 
-    def __eq__(self, other):
+    def equals(
+        self,
+        other,
+        *,
+        ignore_metadata=False,
+        ignore_ts_metadata=False,
+        ignore_provenance=False,
+        ignore_timestamps=False,
+    ):
+        """
+        Returns True if  `self` and `other` are equal. By default, two table
+        collections are considered equal if their
+
+        - ``sequence_length`` properties are identical;
+        - top-level tree sequence metadata and metadata schemas are
+          byte-wise identical;
+        - constituent tables are byte-wise identical.
+
+        Some of the requirements in this definition can be relaxed using the
+        parameters, which can be used to remove certain parts of the data model
+        from the comparison.
+
+        Table indexes are not considered in the equality comparison.
+
+        :param TableCollection other: Another table collection.
+        :param bool ignore_metadata: If True *all* metadata and metadata schemas
+            will be excluded from the comparison. This includes the top-level
+            tree sequence and constituent table metadata (default=False).
+        :param bool ignore_ts_metadata: If True the top-level tree sequence
+            metadata and metadata schemas will be excluded from the comparison.
+            If ``ignore_metadata`` is True, this parameter has no effect.
+        :param bool ignore_provenance: If True the provenance tables are
+            not included in the comparison.
+        :param bool ignore_timestamps: If True the provenance timestamp column
+            is ignored in the comparison. If ``ignore_provenance`` is True, this
+            parameter has no effect.
+        :return: True if other is equal to this table collection; False otherwise.
+        :rtype: bool
+        """
         ret = False
         if type(other) is type(self):
-            ret = bool(self._ll_tables.equals(other._ll_tables))
+            ret = bool(
+                self._ll_tables.equals(
+                    other._ll_tables,
+                    ignore_metadata=bool(ignore_metadata),
+                    ignore_ts_metadata=bool(ignore_ts_metadata),
+                    ignore_provenance=bool(ignore_provenance),
+                    ignore_timestamps=bool(ignore_timestamps),
+                )
+            )
         return ret
 
-    def __ne__(self, other):
-        return not self.__eq__(other)
+    def __eq__(self, other):
+        return self.equals(other)
 
     def __getstate__(self):
         return self.asdict()
+
+    @classmethod
+    def load(cls, file_or_path):
+        file, local_file = util.convert_file_like_to_open_file(file_or_path, "rb")
+        ll_tc = _tskit.TableCollection(1)
+        ll_tc.load(file)
+        tc = TableCollection(1)
+        tc._ll_tables = ll_tc
+        return tc
+
+    def dump(self, file_or_path):
+        """
+        Writes the table collection to the specified path or file object.
+
+        :param str file_or_path: The file object or path to write the TreeSequence to.
+        """
+        file, local_file = util.convert_file_like_to_open_file(file_or_path, "wb")
+        try:
+            self._ll_tables.dump(file)
+        finally:
+            if local_file:
+                file.close()
 
     # Unpickle support
     def __setstate__(self, state):
@@ -2186,7 +2441,6 @@ class TableCollection:
             tables.metadata = tables.metadata_schema.decode_row(tables_dict["metadata"])
         except KeyError:
             pass
-
         tables.individuals.set_columns(**tables_dict["individuals"])
         tables.nodes.set_columns(**tables_dict["nodes"])
         tables.edges.set_columns(**tables_dict["edges"])
@@ -2195,6 +2449,12 @@ class TableCollection:
         tables.mutations.set_columns(**tables_dict["mutations"])
         tables.populations.set_columns(**tables_dict["populations"])
         tables.provenances.set_columns(**tables_dict["provenances"])
+
+        # Indexes must be last as other wise the check for their consistency will fail
+        try:
+            tables.indexes = TableCollectionIndexes(**tables_dict["indexes"])
+        except KeyError:
+            pass
         return tables
 
     def copy(self):
@@ -2213,12 +2473,15 @@ class TableCollection:
         in canonical form (i.e., does not meet sorting requirements) or cannot be
         interpreted as a tree sequence an exception is raised. The
         :meth:`.sort` method may be used to ensure that input sorting requirements
-        are met.
+        are met. If the table collection does not have indexes they will be
+        built.
 
         :return: A :class:`TreeSequence` instance reflecting the structures
             defined in this set of tables.
         :rtype: .TreeSequence
         """
+        if not self.has_index():
+            self.build_index()
         return tskit.TreeSequence.load_tables(self)
 
     def simplify(
@@ -2230,6 +2493,7 @@ class TableCollection:
         filter_individuals=True,
         filter_sites=True,
         keep_unary=False,
+        keep_unary_in_individuals=None,
         keep_input_roots=False,
         record_provenance=True,
         filter_zero_mutation_sites=None,  # Deprecated alias for filter_sites
@@ -2239,7 +2503,7 @@ class TableCollection:
         to reconstruct the tree sequence describing the given ``samples``.
         This will change the ID of the nodes, so that the node
         ``samples[k]`` will have ID ``k`` in the result. The resulting
-        NodeTable will have only the first ``len(samples)`` individuals marked
+        NodeTable will have only the first ``len(samples)`` nodes marked
         as samples. The mapping from node IDs in the current set of tables to
         their equivalent values in the simplified tables is also returned as a
         numpy array. If an array ``a`` is returned by this function and ``u``
@@ -2249,7 +2513,7 @@ class TableCollection:
 
         Tables operated on by this function must: be sorted (see
         :meth:`TableCollection.sort`), have children be born strictly after their
-        parents, and the intervals on which any individual is a child must be
+        parents, and the intervals on which any node is a child must be
         disjoint. Other than this the tables need not satisfy remaining
         requirements to specify a valid tree sequence (but the resulting tables
         will).
@@ -2275,12 +2539,19 @@ class TableCollection:
             not referenced by mutations after simplification; new site IDs are
             allocated sequentially from zero. If False, the site table will not
             be altered in any way. (Default: True)
-        :param bool keep_unary: If True, any unary nodes (i.e. nodes with exactly
-            one child) that exist on the path from samples to root will be preserved
-            in the output. (Default: False)
-        :param bool keep_input_roots: If True, insert edges from the MRCAs of the
-            samples to the roots in the input trees. If False, no topology older
-            than the MRCAs of the samples will be included. (Default: False)
+        :param bool keep_unary: If True, preserve unary nodes (i.e. nodes with
+            exactly one child) that exist on the path from samples to root.
+            (Default: False)
+        :param bool keep_unary_in_individuals: If True, preserve unary nodes
+            that exist on the path from samples to root, but only if they are
+            associated with an individual in the individuals table. Cannot be
+            specified at the same time as ``keep_unary``. (Default: ``None``,
+            equivalent to False)
+        :param bool keep_input_roots: Whether to retain history ancestral to the
+            MRCA of the samples. If ``False``, no topology older than the MRCAs of the
+            samples will be included. If ``True`` the roots of all trees in the returned
+            tree sequence will be the same roots as in the original tree sequence.
+            (Default: False)
         :param bool record_provenance: If True, record details of this call to
             simplify in the returned tree sequence's provenance information
             (Default: True).
@@ -2290,10 +2561,10 @@ class TableCollection:
         :rtype: numpy.ndarray (dtype=np.int32)
         """
         if filter_zero_mutation_sites is not None:
-            # Deprecated in 0.6.1.
+            # Deprecated in msprime 0.6.1.
             warnings.warn(
                 "filter_zero_mutation_sites is deprecated; use filter_sites instead",
-                DeprecationWarning,
+                FutureWarning,
             )
             filter_sites = filter_zero_mutation_sites
         if samples is None:
@@ -2303,6 +2574,9 @@ class TableCollection:
             ].astype(np.int32)
         else:
             samples = util.safe_np_int_cast(samples, np.int32)
+        if keep_unary_in_individuals is None:
+            keep_unary_in_individuals = False
+
         node_map = self._ll_tables.simplify(
             samples,
             filter_sites=filter_sites,
@@ -2310,6 +2584,7 @@ class TableCollection:
             filter_populations=filter_populations,
             reduce_to_site_topology=reduce_to_site_topology,
             keep_unary=keep_unary,
+            keep_unary_in_individuals=keep_unary_in_individuals,
             keep_input_roots=keep_input_roots,
         )
         if record_provenance:
@@ -2421,10 +2696,49 @@ class TableCollection:
         currently rearrange tables so that mutations occur after their mutation parents,
         which is a requirement for valid tree sequences.
 
+        Migrations are sorted by ``time``, ``source``, ``dest``, ``left`` and
+        ``node`` values. This defines a total sort order, such that any permutation
+        of a valid migration table will be sorted into the same output order.
+        Note that this sorting order exceeds the
+        :ref:`migration sorting requirements <sec_migration_requirements>` for a
+        valid tree sequence, which only requires that migrations are sorted by
+        time value.
+
         :param int edge_start: The index in the edge table where sorting starts
             (default=0; must be <= len(edges)).
         """
         self._ll_tables.sort(edge_start)
+        # TODO add provenance
+
+    def canonicalise(self, remove_unreferenced=None):
+        """
+        This puts the tables in *canonical* form - to do this, the individual
+        and population tables are sorted by the first node that refers to each
+        (see :meth:`TreeSequence.subset`) Then, the remaining tables are sorted
+        as in :meth:`.sort`, with the modification that mutations are sorted by
+        site, then time, then number of descendant mutations (ensuring that
+        parent mutations occur before children), then node, then original order
+        in the tables. This ensures that any two tables with the same
+        information should be identical after canonical sorting.
+
+        By default, the method removes sites, individuals, and populations that
+        are not referenced (by mutations and nodes, respectively). If you wish
+        to keep these, pass ``remove_unreferenced=False``, but note that
+        unreferenced individuals and populations are put at the end of the tables
+        in their original order.
+
+        .. seealso::
+
+            :meth:`.sort` for sorting edges, mutations, and sites, and
+            :meth:`.subset` for reordering nodes, individuals, and populations.
+
+        :param bool remove_unreferenced: Whether to remove unreferenced sites,
+            individuals, and populations (default=True).
+        """
+        remove_unreferenced = (
+            True if remove_unreferenced is None else remove_unreferenced
+        )
+        self._ll_tables.canonicalise(remove_unreferenced=remove_unreferenced)
         # TODO add provenance
 
     def compute_mutation_parents(self):
@@ -2474,6 +2788,9 @@ class TableCollection:
         duplicate ``position`` (and keeping only the *first* entry for each
         site), and renumbering the ``site`` column of the mutation table
         appropriately.  This requires the site table to be sorted by position.
+
+        .. warning:: This method does not sort the tables afterwards, so
+            mutations may no longer be sorted by time.
         """
         self._ll_tables.deduplicate_sites()
         # TODO add provenance
@@ -2579,16 +2896,17 @@ class TableCollection:
             in increasing order. The list of intervals must be interpretable as a
             2D numpy array with shape (N, 2), where N is the number of intervals.
         :param bool simplify: If True, run simplify on the tables so that nodes
-            no longer used are discarded. (Default: True).
+            no longer used are discarded. Must be ``False`` if input tree sequence
+            includes migrations. (Default: True).
         :param bool record_provenance: If ``True``, add details of this operation
             to the provenance table in this TableCollection. (Default: ``True``).
         """
         intervals = util.intervals_to_np_array(intervals, 0, self.sequence_length)
-        if len(self.migrations) > 0:
-            raise ValueError("Migrations not supported by keep_ and delete_ intervals")
 
         edges = self.edges.copy()
         self.edges.clear()
+        migrations = self.migrations.copy()
+        self.migrations.clear()
         keep_sites = np.repeat(False, self.sites.num_rows)
         for s, e in intervals:
             curr_keep_sites = np.logical_and(
@@ -2598,15 +2916,37 @@ class TableCollection:
             keep_edges = np.logical_not(
                 np.logical_or(edges.right <= s, edges.left >= e)
             )
+            metadata, metadata_offset = keep_with_offset(
+                keep_edges, edges.metadata, edges.metadata_offset
+            )
             self.edges.append_columns(
                 left=np.fmax(s, edges.left[keep_edges]),
                 right=np.fmin(e, edges.right[keep_edges]),
                 parent=edges.parent[keep_edges],
                 child=edges.child[keep_edges],
+                metadata=metadata,
+                metadata_offset=metadata_offset,
+            )
+            keep_migrations = np.logical_not(
+                np.logical_or(migrations.right <= s, migrations.left >= e)
+            )
+            metadata, metadata_offset = keep_with_offset(
+                keep_migrations, migrations.metadata, migrations.metadata_offset
+            )
+            self.migrations.append_columns(
+                left=np.fmax(s, migrations.left[keep_migrations]),
+                right=np.fmin(e, migrations.right[keep_migrations]),
+                node=migrations.node[keep_migrations],
+                source=migrations.source[keep_migrations],
+                dest=migrations.dest[keep_migrations],
+                time=migrations.time[keep_migrations],
+                metadata=metadata,
+                metadata_offset=metadata_offset,
             )
         self.delete_sites(
             np.where(np.logical_not(keep_sites))[0], record_provenance=False
         )
+
         self.sort()
         if simplify:
             self.simplify(record_provenance=False)
@@ -2618,7 +2958,13 @@ class TableCollection:
 
     def _check_trim_conditions(self):
         if self.migrations.num_rows > 0:
-            raise ValueError("You cannot trim a tree sequence containing migrations")
+            if (np.min(self.migrations.left) < np.min(self.edges.left)) and (
+                np.max(self.migrations.right) > np.max(self.edges.right)
+            ):
+                raise ValueError(
+                    "Cannot trim a tree sequence with migrations which exist to the"
+                    "left of the leftmost edge or to the right of the rightmost edge."
+                )
         if self.edges.num_rows == 0:
             raise ValueError(
                 "Trimming a tree sequence with no edges would reduce the sequence length"
@@ -2652,6 +2998,14 @@ class TableCollection:
             ancestral_state_offset=self.sites.ancestral_state_offset,
             metadata=self.sites.metadata,
             metadata_offset=self.sites.metadata_offset,
+        )
+        self.migrations.set_columns(
+            left=self.migrations.left - leftmost,
+            right=self.migrations.right - leftmost,
+            time=self.migrations.time,
+            node=self.migrations.node,
+            source=self.migrations.source,
+            dest=self.migrations.dest,
         )
         self.sequence_length = self.sequence_length - leftmost
         if record_provenance:
@@ -2707,6 +3061,29 @@ class TableCollection:
                 record=json.dumps(provenance.get_provenance_dict(parameters))
             )
 
+    def clear(
+        self,
+        clear_provenance=False,
+        clear_metadata_schemas=False,
+        clear_ts_metadata_and_schema=False,
+    ):
+        """
+        Remove all rows of the data tables, optionally remove provenance, metadata
+        schemas and ts-level metadata.
+
+        :param bool clear_provenance: If ``True``, remove all rows of the provenance
+            table. (Default: ``False``).
+        :param bool clear_metadata_schemas: If ``True``, clear the table metadata
+            schemas. (Default: ``False``).
+        :param bool clear_ts_metadata_and_schema: If ``True``, clear the tree-sequence
+            level metadata and schema (Default: ``False``).
+        """
+        self._ll_tables.clear(
+            clear_provenance=clear_provenance,
+            clear_metadata_schemas=clear_metadata_schemas,
+            clear_ts_metadata_and_schema=clear_ts_metadata_and_schema,
+        )
+
     def has_index(self):
         """
         Returns True if this TableCollection is indexed.
@@ -2727,20 +3104,45 @@ class TableCollection:
         """
         self._ll_tables.drop_index()
 
-    def subset(self, nodes, record_provenance=True):
+    def subset(
+        self,
+        nodes,
+        record_provenance=True,
+        *,
+        reorder_populations=None,
+        remove_unreferenced=None,
+    ):
         """
         Modifies the tables in place to contain only the entries referring to
-        the provided list of nodes, with nodes reordered according to the order
-        they appear in the list. See :meth:`TreeSequence.subset` for a more
-        detailed description.
+        the provided list of node IDs, with nodes reordered according to the
+        order they appear in the list. See :meth:`TreeSequence.subset` for a
+        more detailed description.
+
+        Note: there are no sortedness requirements on the tables.
 
         :param list nodes: The list of nodes for which to retain information. This
             may be a numpy array (or array-like) object (dtype=np.int32).
         :param bool record_provenance: Whether to record a provenance entry
             in the provenance table for this operation.
+        :param bool reorder_populations: Whether to reorder the population table
+            (default: True).  If False, the population table will not be altered
+            in any way.
+        :param bool remove_unreferenced: Whether sites, individuals, and populations
+            that are not referred to by any retained entries in the tables should
+            be removed (default: True). See the description for details.
         """
+        reorder_populations = (
+            True if reorder_populations is None else reorder_populations
+        )
+        remove_unreferenced = (
+            True if remove_unreferenced is None else remove_unreferenced
+        )
         nodes = util.safe_np_int_cast(nodes, np.int32)
-        self._ll_tables.subset(nodes)
+        self._ll_tables.subset(
+            nodes,
+            reorder_populations=reorder_populations,
+            remove_unreferenced=remove_unreferenced,
+        )
         if record_provenance:
             parameters = {"command": "subset", "nodes": nodes.tolist()}
             self.provenances.add_row(

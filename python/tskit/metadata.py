@@ -26,6 +26,7 @@ import abc
 import collections
 import copy
 import json
+import pprint
 import struct
 from itertools import islice
 from typing import Any
@@ -162,8 +163,21 @@ def binary_format_validator(validator, types, instance, schema):
         )
 
 
+def required_validator(validator, required, instance, schema):
+    # Do the normal validation
+    yield from jsonschema._validators.required(validator, required, instance, schema)
+
+    # For struct codec if a property is not required, then it must have a default
+    for prop, sub_schema in instance["properties"].items():
+        if prop not in instance["required"] and "default" not in sub_schema:
+            yield jsonschema.ValidationError(
+                f"Optional property '{prop}' must have" f" a default value"
+            )
+
+
 StructCodecSchemaValidator = jsonschema.validators.extend(
-    TSKITMetadataSchemaValidator, {"type": binary_format_validator}
+    TSKITMetadataSchemaValidator,
+    {"type": binary_format_validator, "required": required_validator},
 )
 META_SCHEMA: Mapping[str, Any] = copy.deepcopy(StructCodecSchemaValidator.META_SCHEMA)
 # No union types
@@ -409,9 +423,22 @@ class StructCodec(AbstractMetadataCodec):
             key: StructCodec.make_encode(prop)
             for key, prop in sub_schema["properties"].items()
         }
-        return lambda obj: b"".join(
-            sub_encoder(obj[key]) for key, sub_encoder in sub_encoders.items()
-        )
+        defaults = {
+            key: prop["default"]
+            for key, prop in sub_schema["properties"].items()
+            if "default" in prop
+        }
+
+        def object_encode(obj):
+            values = []
+            for key, sub_encoder in sub_encoders.items():
+                try:
+                    values.append(sub_encoder(obj[key]))
+                except KeyError:
+                    values.append(sub_encoder(defaults[key]))
+            return b"".join(values)
+
+        return object_encode
 
     @classmethod
     def make_object_or_null_encode(cls, sub_schema):
@@ -444,7 +471,7 @@ class StructCodec(AbstractMetadataCodec):
 
     @classmethod
     def modify_schema(cls, schema: Mapping) -> Mapping:
-        # This codec requires that all properties are required and additional ones
+        # This codec requires that additional properties are
         # not allowed. Rather than get schema authors to repeat that everywhere
         # we add it here, sadly we can't do this in the metaschema as "default" isn't
         # used by the validator.
@@ -453,8 +480,19 @@ class StructCodec(AbstractMetadataCodec):
                 return [enforce_fixed_properties(j) for j in obj]
             elif type(obj) == dict:
                 ret = {k: enforce_fixed_properties(v) for k, v in obj.items()}
-                if ret.get("type") == "object":
-                    ret["required"] = list(ret.get("properties", {}).keys())
+                if "object" in ret.get("type", []):
+                    if ret.get("additional_properties"):
+                        raise ValueError(
+                            "Struct codec does not support additional_properties"
+                        )
+                    # To prevent authors having to list required properties the default
+                    # is that all without a default are required.
+                    if "required" not in ret:
+                        ret["required"] = [
+                            prop
+                            for prop, sub_schema in ret.get("properties", {}).items()
+                            if "default" not in sub_schema
+                        ]
                     ret["additionalProperties"] = False
                 return ret
             else:
@@ -509,6 +547,7 @@ class MetadataSchema:
             self._validate_row = validate_bytes
             self.encode_row = NOOPCodec({}).encode
             self.decode_row = NOOPCodec({}).decode
+            self.empty_value = b""
         else:
             try:
                 TSKITMetadataSchemaValidator.check_schema(schema)
@@ -529,17 +568,29 @@ class MetadataSchema:
             self._validate_row = TSKITMetadataSchemaValidator(schema).validate
             self.encode_row = codec_instance.encode
             self.decode_row = codec_instance.decode
+            self.empty_value = {}
+
+    def __repr__(self) -> str:
+        return self._string
 
     def __str__(self) -> str:
-        return self._string
+        return pprint.pformat(self._schema)
 
     def __eq__(self, other) -> bool:
         return self._string == other._string
 
     @property
     def schema(self) -> Optional[Mapping[str, Any]]:
-        # Make schema read-only
-        return self._schema
+        # Return a copy to avoid unintentional mutation
+        return copy.deepcopy(self._schema)
+
+    def asdict(self) -> Optional[Mapping[str, Any]]:
+        """
+        Returns a dict representation of this schema. One possible use of this is to
+        modify this dict and then pass it to the ``MetadataSchema`` constructor to create
+        a similar schema.
+        """
+        return self.schema
 
     def validate_and_encode_row(self, row: Any) -> bytes:
         """

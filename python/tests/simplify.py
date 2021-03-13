@@ -109,6 +109,7 @@ class Simplifier:
         filter_populations=True,
         filter_individuals=True,
         keep_unary=False,
+        keep_unary_in_individuals=False,
         keep_input_roots=False,
     ):
         self.ts = ts
@@ -119,6 +120,7 @@ class Simplifier:
         self.filter_populations = filter_populations
         self.filter_individuals = filter_individuals
         self.keep_unary = keep_unary
+        self.keep_unary_in_individuals = keep_unary_in_individuals
         self.keep_input_roots = keep_input_roots
         self.num_mutations = ts.num_mutations
         self.input_sites = list(ts.sites())
@@ -295,7 +297,10 @@ class Simplifier:
                 if is_sample:
                     self.record_edge(left, right, output_id, ancestry_node)
                     ancestry_node = output_id
-                elif self.keep_unary:
+                elif self.keep_unary or (
+                    self.keep_unary_in_individuals
+                    and self.ts.node(input_id).individual >= 0
+                ):
                     if output_id == -1:
                         output_id = self.record_node(input_id)
                     self.record_edge(left, right, output_id, ancestry_node)
@@ -308,7 +313,10 @@ class Simplifier:
             if is_sample and left != prev_right:
                 # Fill in any gaps in the ancestry for the sample
                 self.add_ancestry(input_id, prev_right, left, output_id)
-            if self.keep_unary:
+            if self.keep_unary or (
+                self.keep_unary_in_individuals
+                and self.ts.node(input_id).individual >= 0
+            ):
                 ancestry_node = output_id
             self.add_ancestry(input_id, left, right, ancestry_node)
             prev_right = right
@@ -453,7 +461,10 @@ class Simplifier:
             if count > 0:
                 row = input_individuals[input_id]
                 output_id = self.tables.individuals.add_row(
-                    flags=row.flags, location=row.location, metadata=row.metadata
+                    flags=row.flags,
+                    location=row.location,
+                    parents=row.parents,
+                    metadata=row.metadata,
                 )
                 individual_id_map[input_id] = output_id
 
@@ -467,6 +478,23 @@ class Simplifier:
             individual=individual_id_map[nodes.individual],
             population=population_id_map[nodes.population],
         )
+
+        # Remap the parent ids of individuals
+        individuals_copy = self.tables.individuals.copy()
+        self.tables.individuals.clear()
+        for row in individuals_copy:
+            mapped_parents = []
+            for p in row.parents:
+                if p == -1:
+                    mapped_parents.append(-1)
+                else:
+                    mapped_parents.append(individual_id_map[p])
+            self.tables.individuals.add_row(
+                flags=row.flags,
+                location=row.location,
+                parents=mapped_parents,
+                metadata=row.metadata,
+            )
 
         # We don't support migrations for now. We'll need to remap these as well.
         assert self.ts.num_migrations == 0
@@ -737,7 +765,6 @@ if __name__ == "__main__":
 
         samples = list(map(int, sys.argv[3:]))
 
-        # When keep_unary = True
         print("When keep_unary = True:")
         s = Simplifier(ts, samples, keep_unary=True)
         # s.print_state()
@@ -748,9 +775,18 @@ if __name__ == "__main__":
         print(tables.sites)
         print(tables.mutations)
 
-        # When keep_unary = False
-        print("\nWhen keep_unary = False:")
+        print("\nWhen keep_unary = False")
         s = Simplifier(ts, samples, keep_unary=False)
+        # s.print_state()
+        tss, _ = s.simplify()
+        tables = tss.dump_tables()
+        print(tables.nodes)
+        print(tables.edges)
+        print(tables.sites)
+        print(tables.mutations)
+
+        print("\nWhen keep_unary_in_individuals = True")
+        s = Simplifier(ts, samples, keep_unary_in_individuals=True)
         # s.print_state()
         tss, _ = s.simplify()
         tables = tss.dump_tables()

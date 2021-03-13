@@ -1,9 +1,89 @@
+----------------------
+[0.99.11] - 2021-0X-XX
+----------------------
+
+**Features**
+
+- Add ``parents`` to the individual table to enable recording of pedigrees
+  (:user:`ivan-krukov`, :user:`benjeffery`, :issue:`852`, :pr:`1125`, :pr:`866`, :pr:`1153`, :pr:`1177`, :pr:`1199`).
+
+- Added a ``tsk_table_collection_canonicalse`` method, that allows checking for equality between
+  tables that are equivalent up to reordering (:user:`petrelharp`, :user:`mufernando`, :pr:`1108`).
+
+- Removed a previous requirement on ``tsk_table_collection_union``, allowing for unioning of
+  new information both above and below shared history (:user:`petrelharp`, :user:`mufernando`, :pr:`1108`).
+
+- Support migrations in tsk_table_collection_sort. (:user:`jeromekelleher`,
+  :issue:`22`, :issue:`117`, :pr:`1131`).
+
+**Breaking changes**
+
+- Method ``tsk_individual_table_add_row`` has an extra arguments ``parents`` and ``parents_length``.
+
+- Add an ``options`` argument to ``tsk_table_collection_subset`` (:user:`petrelharp`, :pr:`1108`),
+  to allow for retaining the order of populations.
+
+**Changes**
+
+- Allow mutations that have the same derived state as their parent mutation.
+  (:user:`benjeffery`, :issue:`1180`, :pr:`1233`)
+
+**Bugfixes**
+
+----------------------
+[0.99.10] - 2021-01-25
+----------------------
+
+Minor bugfix on internal APIs
+
 ---------------------
-[0.99.7] - 2020-XX-XX
+[0.99.9] - 2021-01-22
+---------------------
+
+**Features**
+
+- Add ``TSK_KEEP_UNARY_IN_INDIVIDUALS`` flag to simplify, which allows the user to
+  keep unary nodes only if they belong to a tabled individual. This is useful for
+  simplification in forwards simulations (:user:`hyanwong`, :issue:`1113`, :pr:`1119`).
+
+
+---------------------
+[0.99.8] - 2020-11-27
+---------------------
+
+**Features**
+
+- Add ``tsk_treeseq_genetic_relatedness`` for calculating genetic relatedness between
+  pairs of sets of nodes (:user:`brieuclehmann`, :issue:`1021`, :pr:`1023`, :issue:`974`,
+  :issue:`973`, :pr:`898`).
+
+- Exposed ``tsk_table_collection_set_indexes`` to the API
+  (:user:`benjeffery`, :issue:`870`, :pr:`921`).
+
+**Breaking changes**
+
+- Added an ``options`` argument to ``tsk_table_collection_equals``
+  and table equality methods to allow for more flexible equality criteria
+  (e.g., ignore top-level metadata and schema or provenance tables).
+  Existing code should add an extra final parameter ``0`` to retain the
+  current behaviour (:user:`mufernando`, :user:`jeromekelleher`,
+  :issue:`896`, :pr:`897`, :issue:`913`, :pr:`917`).
+
+- Changed default behaviour of ``tsk_table_collection_clear`` to not clear
+  provenances and added ``options`` argument to optionally clear provenances
+  and schemas (:user:`benjeffery`, :issue:`929`, :pr:`1001`).
+
+- Renamed ``ts.trait_regression`` to ``ts.trait_linear_model``.
+
+---------------------
+[0.99.7] - 2020-09-29
 ---------------------
 
 - Added ``TSK_INCLUDE_TERMINAL`` option to ``tsk_diff_iter_init`` to output the last edges
-  at the end of a tree sequence (:user:`hyanwong`, :issue:`783`, :pr:`787`)
+  at the end of a tree sequence (:user:`hyanwong`, :issue:`783`, :pr:`787`).
+
+- Added ``tsk_bug_assert`` for assertions that should be compiled into release binaries
+  (:user:`benjeffery`, :pr:`860`).
 
 ---------------------
 [0.99.6] - 2020-09-04
@@ -22,7 +102,7 @@
 **Breaking changes**
 
 - The macro ``TSK_IMPUTE_MISSING_DATA`` is renamed to ``TSK_ISOLATED_NOT_MISSING``
-  (:user:`benjeffery`, :issue:`716`, :pr:`794`)  
+  (:user:`benjeffery`, :issue:`716`, :pr:`794`)
 
 **New features**
 

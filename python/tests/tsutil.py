@@ -24,6 +24,7 @@
 A collection of utilities to edit and construct tree sequences.
 """
 import collections
+import functools
 import json
 import random
 import string
@@ -135,6 +136,41 @@ def insert_branch_mutations(ts, mutations_per_branch=1):
     return tables.tree_sequence()
 
 
+def remove_mutation_times(ts):
+    tables = ts.tables
+    tables.mutations.time = np.full_like(tables.mutations.time, tskit.UNKNOWN_TIME)
+    return tables.tree_sequence()
+
+
+def insert_discrete_time_mutations(ts, num_times=4, num_sites=10):
+    """
+    Inserts mutations in the tree sequence at regularly-spaced num_sites
+    positions, at only a discrete set of times (the same for all trees): at
+    num_times times evenly spaced between 0 and the maximum tree height.
+    """
+    tables = ts.tables
+    tables.sites.clear()
+    tables.mutations.clear()
+    height = max([t.time(t.roots[0]) for t in ts.trees()])
+    for j, pos in enumerate(np.linspace(0, tables.sequence_length, num_sites + 1)[:-1]):
+        anc = "X" * j
+        tables.sites.add_row(position=pos, ancestral_state=anc)
+        t = ts.at(pos)
+        for k, s in enumerate(np.linspace(0, height, num_times)):
+            for n in t.nodes():
+                if t.time(n) <= s and (
+                    (t.parent(n) == tskit.NULL) or (t.time(t.parent(n)) > s)
+                ):
+                    tables.mutations.add_row(
+                        site=j, node=n, derived_state=anc + str(k), time=s
+                    )
+                    k += 1
+    tables.sort()
+    tables.build_index()
+    tables.compute_mutation_parents()
+    return tables.tree_sequence()
+
+
 def insert_branch_sites(ts):
     """
     Returns a copy of the specified tree sequence with a site on every branch
@@ -206,27 +242,41 @@ def insert_random_ploidy_individuals(ts, max_ploidy=5, max_dimension=3, seed=1):
     return tables.tree_sequence()
 
 
-def insert_individuals(ts, samples=None, ploidy=1):
+def insert_individuals(ts, nodes=None, ploidy=1):
     """
     Inserts individuals into the tree sequence using the specified list
-    of samples (or all samples if None) with the specified ploidy by combining
-    ploidy-sized chunks of the list.
+    of node (or use all sample nodes if None) with the specified ploidy by combining
+    ploidy-sized chunks of the list. Add metadata to the individuals so we can
+    track them
     """
-    if samples is None:
-        samples = ts.samples()
-    if len(samples) % ploidy != 0:
-        raise ValueError("number of samples must be divisible by ploidy")
+    if nodes is None:
+        nodes = ts.samples()
+    assert len(nodes) % ploidy == 0  # To allow mixed ploidies we could comment this out
     tables = ts.dump_tables()
     tables.individuals.clear()
     individual = tables.nodes.individual[:]
     individual[:] = tskit.NULL
     j = 0
-    while j < len(samples):
-        nodes = samples[j : j + ploidy]
-        ind_id = tables.individuals.add_row()
-        individual[nodes] = ind_id
+    while j < len(nodes):
+        nodes_in_individual = nodes[j : min(len(nodes), j + ploidy)]
+        # should we warn here if nodes[j : j + ploidy] are at different times?
+        # probably not, as although this is unusual, it is actually allowed
+        ind_id = tables.individuals.add_row(
+            metadata=f"orig_id {tables.individuals.num_rows}".encode()
+        )
+        individual[nodes_in_individual] = ind_id
         j += ploidy
     tables.nodes.individual = individual
+    return tables.tree_sequence()
+
+
+def mark_metadata(ts, table_name, prefix="orig_id:"):
+    """
+    Add metadata to all rows of the form prefix + row_number
+    """
+    tables = ts.dump_tables()
+    table = getattr(tables, table_name)
+    table.packset_metadata([(prefix + str(i)).encode() for i in range(table.num_rows)])
     return tables.tree_sequence()
 
 
@@ -322,16 +372,21 @@ def single_childify(ts):
         for mut in mutations_on_edge[edge.id]:
             if mut.time < t:
                 tables.mutations.add_row(
-                    mut.site,
-                    mut.node,
-                    mut.time,
-                    mut.derived_state,
-                    mut.parent,
-                    mut.metadata,
+                    site=mut.site,
+                    node=mut.node,
+                    time=mut.time,
+                    derived_state=mut.derived_state,
+                    parent=mut.parent,
+                    metadata=mut.metadata,
                 )
             else:
                 tables.mutations.add_row(
-                    mut.site, u, mut.derived_state, mut.parent, mut.metadata, mut.time
+                    site=mut.site,
+                    node=u,
+                    derived_state=mut.derived_state,
+                    parent=mut.parent,
+                    metadata=mut.metadata,
+                    time=mut.time,
                 )
     tables.sort()
     add_provenance(tables.provenances, "insert_redundant_breakpoints")
@@ -396,6 +451,8 @@ def add_random_metadata(ts, seed=1, max_length=10):
         flags=individuals.flags,
         location=individuals.location,
         location_offset=individuals.location_offset,
+        parents=individuals.parents,
+        parents_offset=individuals.parents_offset,
         metadata_offset=offset,
         metadata=metadata,
     )
@@ -452,14 +509,14 @@ def generate_site_mutations(
                 x = random.expovariate(mu)
                 new_state = state
                 while x < branch_length:
-                    new_state = random.choice([s for s in states if s != state])
-                    if multiple_per_node and (state != new_state):
+                    new_state = random.choice(states)
+                    if multiple_per_node:
                         mutation_table.add_row(site, u, new_state, parent)
                         parent = mutation_table.num_rows - 1
                         state = new_state
                     x += random.expovariate(mu)
                 else:
-                    if (not multiple_per_node) and (state != new_state):
+                    if not multiple_per_node:
                         mutation_table.add_row(site, u, new_state, parent)
                         parent = mutation_table.num_rows - 1
                         state = new_state
@@ -569,31 +626,34 @@ def compute_mutation_parent(ts):
     return mutation_parent
 
 
-def py_subset(tables, nodes, record_provenance=True):
+def py_subset(
+    tables,
+    nodes,
+    record_provenance=True,
+    reorder_populations=True,
+    remove_unreferenced=True,
+):
     """
     Naive implementation of the TableCollection.subset method using the Python API.
     """
     if np.any(nodes > tables.nodes.num_rows) or np.any(nodes < 0):
         raise ValueError("Nodes out of bounds.")
     full = tables.copy()
-    # there is no table collection clear in the py API
-    tables.nodes.clear()
-    tables.individuals.clear()
-    tables.populations.clear()
-    tables.edges.clear()
-    tables.migrations.clear()
-    tables.sites.clear()
-    tables.mutations.clear()
+    tables.clear()
     # mapping from old to new ids
     node_map = {}
     ind_map = {tskit.NULL: tskit.NULL}
     pop_map = {tskit.NULL: tskit.NULL}
+    if not reorder_populations:
+        for j, pop in enumerate(full.populations):
+            pop_map[j] = j
+            tables.populations.add_row(metadata=pop.metadata)
     for old_id in nodes:
         node = full.nodes[old_id]
         if node.individual not in ind_map and node.individual != tskit.NULL:
             ind = full.individuals[node.individual]
             new_ind_id = tables.individuals.add_row(
-                ind.flags, ind.location, ind.metadata
+                ind.flags, ind.location, ind.parents, ind.metadata
             )
             ind_map[node.individual] = new_ind_id
         if node.population not in pop_map and node.population != tskit.NULL:
@@ -608,6 +668,18 @@ def py_subset(tables, nodes, record_provenance=True):
             node.metadata,
         )
         node_map[old_id] = new_id
+    if not remove_unreferenced:
+        for j, ind in enumerate(full.individuals):
+            if j not in ind_map:
+                ind_map[j] = tables.individuals.add_row(
+                    ind.flags,
+                    location=ind.location,
+                    parents=ind.parents,
+                    metadata=ind.metadata,
+                )
+        for j, ind in enumerate(full.populations):
+            if j not in pop_map:
+                pop_map[j] = tables.populations.add_row(ind.metadata)
     for edge in full.edges:
         if edge.child in nodes and edge.parent in nodes:
             tables.edges.add_row(
@@ -620,6 +692,11 @@ def py_subset(tables, nodes, record_provenance=True):
     if full.migrations.num_rows > 0:
         raise ValueError("Migrations are currently not supported in this operation.")
     site_map = {}
+    if not remove_unreferenced:
+        for j, site in enumerate(full.sites):
+            site_map[j] = tables.sites.add_row(
+                site.position, site.ancestral_state, site.metadata
+            )
     mutation_map = {tskit.NULL: tskit.NULL}
     for i, mut in enumerate(full.mutations):
         if mut.node in nodes:
@@ -657,7 +734,10 @@ def py_union(tables, other, nodes, record_provenance=True, add_populations=True)
             if ind_map[node.individual] == tskit.NULL and node.individual != tskit.NULL:
                 ind = other.individuals[node.individual]
                 ind_id = tables.individuals.add_row(
-                    flags=ind.flags, location=ind.location, metadata=ind.metadata
+                    flags=ind.flags,
+                    location=ind.location,
+                    parents=ind.parents,
+                    metadata=ind.metadata,
                 )
                 ind_map[node.individual] = ind_id
             if pop_map[node.population] == tskit.NULL and node.population != tskit.NULL:
@@ -677,9 +757,6 @@ def py_union(tables, other, nodes, record_provenance=True, add_populations=True)
             node_map[other_id] = node_id
     for edge in other.edges:
         if (nodes[edge.parent] == tskit.NULL) or (nodes[edge.child] == tskit.NULL):
-            # can't do this right not because of sorting of mutations
-            if (nodes[edge.parent] == tskit.NULL) and (nodes[edge.child] != tskit.NULL):
-                raise ValueError("Cannot graft nodes above existing nodes.")
             tables.edges.add_row(
                 left=edge.left,
                 right=edge.right,
@@ -703,6 +780,7 @@ def py_union(tables, other, nodes, record_provenance=True, add_populations=True)
                 node=node_map[mut.node],
                 derived_state=mut.derived_state,
                 parent=tskit.NULL,
+                time=mut.time,
                 metadata=mut.metadata,
             )
             mut_map[other_id] = mut_id
@@ -713,6 +791,9 @@ def py_union(tables, other, nodes, record_provenance=True, add_populations=True)
     # sorting, deduplicating sites, and re-computing mutation parents
     tables.sort()
     tables.deduplicate_sites()
+    # need to sort again since after deduplicating sites, mutations may not be
+    # sorted by time within sites
+    tables.sort()
     tables.build_index()
     tables.compute_mutation_parents()
 
@@ -758,6 +839,286 @@ def compute_mutation_times(ts):
     tables.mutations.time = times
     tables.sort()
     return tables.mutations.time
+
+
+def shuffle_tables(
+    tables,
+    seed,
+    shuffle_edges=True,
+    shuffle_populations=True,
+    shuffle_individuals=True,
+    shuffle_sites=True,
+    shuffle_mutations=True,
+    shuffle_migrations=True,
+    keep_mutation_parent_order=False,
+):
+    """
+    Randomizes the order of rows in (possibly) all except the Node table.  Note
+    that if mutations are completely shuffled, then TableCollection.sort() will
+    not necessarily produce valid tables (unless all mutation times are present
+    and distinct), since currently only canonicalise puts parent mutations
+    before children.  However, setting keep_mutation_parent_order to True will
+    maintain the order of mutations within each site.
+
+    :param TableCollection tables: The table collection that is shuffled (in place).
+    """
+    rng = random.Random(seed)
+    orig = tables.copy()
+    tables.nodes.clear()
+    tables.individuals.clear()
+    tables.populations.clear()
+    tables.edges.clear()
+    tables.sites.clear()
+    tables.mutations.clear()
+    tables.drop_index()
+    # populations
+    randomised_pops = list(enumerate(orig.populations))
+    if shuffle_populations:
+        rng.shuffle(randomised_pops)
+    pop_id_map = {tskit.NULL: tskit.NULL}
+    for j, p in randomised_pops:
+        pop_id_map[j] = tables.populations.add_row(metadata=p.metadata)
+    # individuals
+    randomised_inds = list(enumerate(orig.individuals))
+    if shuffle_individuals:
+        rng.shuffle(randomised_inds)
+    ind_id_map = {tskit.NULL: tskit.NULL}
+    for j, i in randomised_inds:
+        ind_id_map[j] = tables.individuals.add_row(
+            flags=i.flags, location=i.location, parents=i.parents, metadata=i.metadata
+        )
+    tables.individuals.parents = [
+        tskit.NULL if i == tskit.NULL else ind_id_map[i]
+        for i in tables.individuals.parents
+    ]
+    # nodes (same order, but remapped populations and individuals)
+    for n in orig.nodes:
+        tables.nodes.add_row(
+            flags=n.flags,
+            time=n.time,
+            population=pop_id_map[n.population],
+            individual=ind_id_map[n.individual],
+            metadata=n.metadata,
+        )
+    # edges
+    randomised_edges = list(orig.edges)
+    if shuffle_edges:
+        rng.shuffle(randomised_edges)
+    for e in randomised_edges:
+        tables.edges.add_row(e.left, e.right, e.parent, e.child, metadata=e.metadata)
+    # migrations
+    randomised_migrations = list(orig.migrations)
+    if shuffle_migrations:
+        rng.shuffle(randomised_migrations)
+    for m in randomised_migrations:
+        tables.migrations.add_row(
+            m.left,
+            m.right,
+            m.node,
+            pop_id_map[m.source],
+            pop_id_map[m.dest],
+            m.time,
+            m.metadata,
+        )
+    # sites
+    randomised_sites = list(enumerate(orig.sites))
+    if shuffle_sites:
+        rng.shuffle(randomised_sites)
+    site_id_map = {}
+    for j, s in randomised_sites:
+        site_id_map[j] = tables.sites.add_row(
+            s.position, ancestral_state=s.ancestral_state, metadata=s.metadata
+        )
+    # mutations
+    randomised_mutations = list(enumerate(orig.mutations))
+    if shuffle_mutations:
+        if keep_mutation_parent_order:
+            # randomise *except* keeping parent mutations before children
+            mut_site_order = [mut.site for mut in orig.mutations]
+            rng.shuffle(mut_site_order)
+            mut_by_site = {s: [] for s in mut_site_order}
+            for j, m in enumerate(orig.mutations):
+                mut_by_site[m.site].insert(0, (j, m))
+            randomised_mutations = []
+            for s in mut_site_order:
+                randomised_mutations.append(mut_by_site[s].pop())
+        else:
+            rng.shuffle(randomised_mutations)
+    mut_id_map = {tskit.NULL: tskit.NULL}
+    for j, (k, _) in enumerate(randomised_mutations):
+        mut_id_map[k] = j
+    for _, m in randomised_mutations:
+        tables.mutations.add_row(
+            site=site_id_map[m.site],
+            node=m.node,
+            derived_state=m.derived_state,
+            parent=mut_id_map[m.parent],
+            metadata=m.metadata,
+            time=m.time,
+        )
+    if keep_mutation_parent_order:
+        assert np.all(tables.mutations.parent < np.arange(tables.mutations.num_rows))
+    return tables
+
+
+def cmp_site(i, j, tables):
+    ret = tables.sites.position[i] - tables.sites.position[j]
+    if ret == 0:
+        ret = i - j
+    return ret
+
+
+def cmp_mutation_canonical(i, j, tables, site_order, num_descendants=None):
+    site_i = tables.mutations.site[i]
+    site_j = tables.mutations.site[j]
+    ret = site_order[site_i] - site_order[site_j]
+    if (
+        ret == 0
+        and (not tskit.is_unknown_time(tables.mutations.time[i]))
+        and (not tskit.is_unknown_time(tables.mutations.time[j]))
+    ):
+        ret = tables.mutations.time[j] - tables.mutations.time[i]
+    if ret == 0:
+        ret = num_descendants[j] - num_descendants[i]
+    if ret == 0:
+        ret = tables.mutations.node[i] - tables.mutations.node[j]
+    if ret == 0:
+        ret = i - j
+    return ret
+
+
+def cmp_mutation(i, j, tables, site_order):
+    site_i = tables.mutations.site[i]
+    site_j = tables.mutations.site[j]
+    ret = site_order[site_i] - site_order[site_j]
+    if (
+        ret == 0
+        and (not tskit.is_unknown_time(tables.mutations.time[i]))
+        and (not tskit.is_unknown_time(tables.mutations.time[j]))
+    ):
+        ret = tables.mutations.time[j] - tables.mutations.time[i]
+    if ret == 0:
+        ret = i - j
+    return ret
+
+
+def cmp_edge(i, j, tables):
+    ret = (
+        tables.nodes.time[tables.edges.parent[i]]
+        - tables.nodes.time[tables.edges.parent[j]]
+    )
+    if ret == 0:
+        ret = tables.edges.parent[i] - tables.edges.parent[j]
+    if ret == 0:
+        ret = tables.edges.child[i] - tables.edges.child[j]
+    if ret == 0:
+        ret = tables.edges.left[i] - tables.edges.left[j]
+    return ret
+
+
+def cmp_migration(i, j, tables):
+    ret = tables.migrations.time[i] - tables.migrations.time[j]
+    if ret == 0:
+        ret = tables.migrations.source[i] - tables.migrations.source[j]
+    if ret == 0:
+        ret = tables.migrations.dest[i] - tables.migrations.dest[j]
+    if ret == 0:
+        ret = tables.migrations.left[i] - tables.migrations.left[j]
+    if ret == 0:
+        ret = tables.migrations.node[i] - tables.migrations.node[j]
+    return ret
+
+
+def compute_mutation_num_descendants(tables):
+    mutations = tables.mutations
+    num_descendants = np.zeros(mutations.num_rows)
+    for p in mutations.parent:
+        while p != tskit.NULL:
+            num_descendants[p] += 1
+            p = mutations.parent[p]
+    return num_descendants
+
+
+def py_canonicalise(tables, remove_unreferenced=True):
+    tables.subset(
+        np.arange(tables.nodes.num_rows),
+        record_provenance=False,
+        remove_unreferenced=remove_unreferenced,
+    )
+    py_sort(tables, use_num_descendants=True)
+
+
+def py_sort(tables, use_num_descendants=False):
+    copy = tables.copy()
+    tables.edges.clear()
+    tables.sites.clear()
+    tables.mutations.clear()
+    tables.migrations.clear()
+    edge_key = functools.cmp_to_key(lambda a, b: cmp_edge(a, b, tables=copy))
+    sorted_edges = sorted(range(copy.edges.num_rows), key=edge_key)
+    site_key = functools.cmp_to_key(lambda a, b: cmp_site(a, b, tables=copy))
+    sorted_sites = sorted(range(copy.sites.num_rows), key=site_key)
+    site_id_map = {k: j for j, k in enumerate(sorted_sites)}
+    site_order = np.argsort(sorted_sites)
+    if use_num_descendants:
+        num_descendants = compute_mutation_num_descendants(copy)
+        mut_key = functools.cmp_to_key(
+            lambda a, b: cmp_mutation_canonical(
+                a,
+                b,
+                tables=copy,
+                site_order=site_order,
+                num_descendants=num_descendants,
+            )
+        )
+    else:
+        mut_key = functools.cmp_to_key(
+            lambda a, b: cmp_mutation(
+                a,
+                b,
+                tables=copy,
+                site_order=site_order,
+            )
+        )
+    sorted_muts = sorted(range(copy.mutations.num_rows), key=mut_key)
+    mut_id_map = {k: j for j, k in enumerate(sorted_muts)}
+    mut_id_map[tskit.NULL] = tskit.NULL
+    mig_key = functools.cmp_to_key(lambda a, b: cmp_migration(a, b, tables=copy))
+    sorted_migs = sorted(range(copy.migrations.num_rows), key=mig_key)
+    for edge_id in sorted_edges:
+        tables.edges.add_row(
+            copy.edges[edge_id].left,
+            copy.edges[edge_id].right,
+            copy.edges[edge_id].parent,
+            copy.edges[edge_id].child,
+        )
+    for site_id in sorted_sites:
+        tables.sites.add_row(
+            copy.sites[site_id].position,
+            copy.sites[site_id].ancestral_state,
+            copy.sites[site_id].metadata,
+        )
+    for mut_id in sorted_muts:
+        tables.mutations.add_row(
+            site_id_map[copy.mutations[mut_id].site],
+            copy.mutations[mut_id].node,
+            copy.mutations[mut_id].derived_state,
+            mut_id_map[copy.mutations[mut_id].parent],
+            copy.mutations[mut_id].metadata,
+            copy.mutations[mut_id].time,
+        )
+    for mig_id in sorted_migs:
+        tables.migrations.add_row(
+            copy.migrations[mig_id].left,
+            copy.migrations[mig_id].right,
+            copy.migrations[mig_id].node,
+            copy.migrations[mig_id].source,
+            copy.migrations[mig_id].dest,
+            copy.migrations[mig_id].time,
+            copy.migrations[mig_id].metadata,
+        )
+
+    sort_individual_table(tables)
 
 
 def algorithm_T(ts):
@@ -1291,25 +1652,96 @@ def genealogical_nearest_neighbours(ts, focal, reference_sets):
     return A
 
 
-def coiterate(ts1, ts2, **kwargs):
+def assert_table_collections_equal(t1, t2, ignore_provenance=False):
     """
-    Returns an iterator over the pairs of trees for each distinct
-    interval in the specified pair of tree sequences.
+    Checks for table collection equality, but step-by-step,
+    so it's easy to see what's different.
     """
-    if ts1.sequence_length != ts2.sequence_length:
-        raise ValueError("Tree sequences must be equal length.")
-    L = ts1.sequence_length
-    trees1 = ts1.trees(**kwargs)
-    trees2 = ts2.trees(**kwargs)
-    tree1 = next(trees1)
-    tree2 = next(trees2)
-    right = 0
-    while right != L:
-        left = right
-        right = min(tree1.interval[1], tree2.interval[1])
-        yield (left, right), tree1, tree2
-        # Advance
-        if tree1.interval[1] == right:
-            tree1 = next(trees1, None)
-        if tree2.interval[1] == right:
-            tree2 = next(trees2, None)
+    assert_tables_equal(t1.populations, t2.populations, "populations")
+    assert_tables_equal(t1.individuals, t2.individuals, "individuals")
+    assert_tables_equal(t1.nodes, t2.nodes, "nodes")
+    assert_tables_equal(t1.edges, t2.edges, "edges")
+    assert_tables_equal(t1.sites, t2.sites, "sites")
+    assert_tables_equal(t1.mutations, t2.mutations, "mutations")
+    assert_tables_equal(t1.migrations, t2.migrations, "migrations")
+    if not ignore_provenance:
+        assert_tables_equal(t1.provenances, t2.provenances, "provenances")
+    assert t1.metadata_schema == t2.metadata_schema
+    assert t1.metadata == t2.metadata
+    assert t1.metadata_bytes == t2.metadata_bytes
+    assert t1.sequence_length == t2.sequence_length
+    assert t1.equals(t2, ignore_provenance=ignore_provenance)
+
+
+def assert_tables_equal(t1, t2, label=""):
+    if hasattr(t1, "metadata_schema"):
+        if t1.metadata_schema != t2.metadata_schema:
+            msg = (
+                f"{label} :::::::::: t1 ::::::::::::\n{t1.metadata_schema}"
+                f"{label} :::::::::: t2 ::::::::::::\n{t1.metadata_schema}"
+            )
+            raise AssertionError(msg)
+    for k, (e1, e2) in enumerate(zip(t1, t2)):
+        if e1 != e2:
+            msg = (
+                f"{label} :::::::::: t1 (row {k}) ::::::::::::\n{e1}"
+                f"{label} :::::::::: t2 (row {k}) ::::::::::::\n{e2}"
+            )
+            raise AssertionError(msg)
+    if t1.num_rows != t2.num_rows:
+        raise AssertionError(
+            f"{label}: t1.num_rows {t1.num_rows} != {t2.num_rows} t2.num_rows"
+        )
+    assert t1 == t2
+
+
+def sort_individual_table(tables):
+    """
+    Sorts the individual table by parents-before-children.
+    """
+
+    individuals = tables.individuals
+    num_individuals = individuals.num_rows
+
+    # First find the set of individuals that have no children
+    # by creating an array of incoming edge counts
+    incoming_edge_count = np.zeros((num_individuals,), np.int64)
+    for parent in individuals.parents:
+        if parent != tskit.NULL:
+            incoming_edge_count[parent] += 1
+
+    todo = collections.deque()
+    sorted_order = []
+    for individual, num_edges in reversed(list(enumerate(incoming_edge_count))):
+        if num_edges == 0:
+            todo.append(individual)
+            sorted_order.append(individual)
+    # Now emit individuals from the set that have no children, removing their edges
+    # as we go adding new individuals to the no children set.
+    while len(todo) > 0:
+        individual = todo.popleft()
+        for parent in individuals[individual].parents:
+            if parent != tskit.NULL:
+                incoming_edge_count[parent] -= 1
+                if incoming_edge_count[parent] == 0:
+                    todo.append(parent)
+                    sorted_order.append(parent)
+
+    if np.sum(incoming_edge_count) > 0:
+        raise ValueError("Individual pedigree has cycles")
+
+    ind_id_map = {tskit.NULL: tskit.NULL}
+
+    individuals_copy = tables.copy().individuals
+    tables.individuals.clear()
+    for row in reversed(sorted_order):
+        ind_id_map[row] = tables.individuals.add_row(
+            flags=individuals_copy[row].flags,
+            location=individuals_copy[row].location,
+            parents=individuals_copy[row].parents,
+            metadata=individuals_copy[row].metadata,
+        )
+    tables.individuals.parents = [ind_id_map[i] for i in tables.individuals.parents]
+    tables.nodes.individual = [ind_id_map[i] for i in tables.nodes.individual]
+
+    return tables

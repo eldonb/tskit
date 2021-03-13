@@ -82,8 +82,9 @@ This codec places extra restrictions on the schema:
     This sets the binary encoding used for the property.
 
 #. All metadata objects must have fixed properties.
-    This means that they can have no missing properties and have no additional
-    properties not listed in the schema.
+    This means that they can no additional properties not listed in the schema. Any
+    property that does not have a `default` specified in the schema must be present.
+    Default values will be encoded.
 
 #. Arrays must be lists of homogeneous objects.
     For example, this is not valid::
@@ -272,7 +273,6 @@ to the individuals in a tree sequence:
             "properties": {
                 "accession_number": {"type": "integer", "binaryFormat": "i"},
                 "collection_date": {
-                    "name": "Collection date",
                     "description": "Date of sample collection in ISO format",
                     "type": "string",
                     "binaryFormat": "10p",

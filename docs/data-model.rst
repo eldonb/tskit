@@ -213,7 +213,7 @@ defaults to the null ID (-1).
 
 The ``flags`` column stores information about a particular node, and
 is composed of 32 bitwise boolean values. Currently, the only flag defined
-is ``IS_SAMPLE = 1``, which defines the *sample* status of nodes. Marking
+is ``NODE_IS_SAMPLE = 1``, which defines the *sample* status of nodes. Marking
 a particular node as a "sample" means, for example, that the mutational state
 of the node will be included in the genotypes produced by
 :meth:`TreeSequence.variants`.
@@ -259,6 +259,7 @@ Column              Type                Description
 ================    ==============      ===========
 flags               uint32              Bitwise flags.
 location            double              Location in arbitrary dimensions
+parents             int32               Ids of parent individuals
 metadata            binary              Individual :ref:`sec_metadata_definition`
 ================    ==============      ===========
 
@@ -280,6 +281,10 @@ dimensions. This column is :ref:`ragged <sec_encoding_ragged_columns>`, and
 so different individuals can have locations with different dimensions (i.e.,
 one individual may have location ``[]`` and another ``[0, 1, 0]``. This could
 therefore be used to store other quantities (e.g., phenotype).
+
+The ``parents`` column stores the ids of other individuals that are the parents of
+an individual. This column is :ref:`ragged <sec_encoding_ragged_columns>` such that an
+individual can have any number of parents.
 
 The ``metadata`` column provides a location for client code to store
 information about each individual. See the :ref:`sec_metadata_definition` section for
@@ -535,10 +540,10 @@ Individual requirements
 -----------------------
 
 Individuals are a basic type in a tree sequence and are not defined with
-respect to any other tables. Therefore, there are no requirements on
-individuals.
+respect to any other tables. Individuals can have a reference to their parent
+individuals, if present these references must be valid or null (-1).
 
-There are no requirements regarding the ordering of individuals.
+Individuals must be sorted such that parents are before children.
 Sorting a set of tables using :meth:`TableCollection.sort` has
 no effect on the individuals.
 
@@ -958,7 +963,8 @@ Accessing roots
 ===============
 
 The roots of a tree are defined as the unique endpoints of upward paths
-starting from sample nodes. Thus, trees can have multiple roots in ``tskit``.
+starting from sample nodes (if no path leads upward from a sample node,
+that node is also a root). Thus, trees can have multiple roots in ``tskit``.
 For example, if we delete the edge joining ``6`` and ``7`` in the previous
 example, we get a tree with two roots:
 
@@ -1077,26 +1083,26 @@ Individual text format
 ======================
 
 The individual text format must contain a ``flags`` column.
-Optionally, there may also be a ``location`` and
+Optionally, there may also be ``location``, ``parents`` and
 ``metadata`` columns. See the :ref:`individual table definitions
 <sec_individual_table_definition>` for details on these columns.
 
 Note that there are currently no globally defined ``flags``, but the column
 is still required; a value of ``0`` means that there are no flags set.
 
-The ``location`` column should be a sequence of comma-separated numeric
+The ``location`` and ``parents`` columns should be a sequence of comma-separated numeric
 values. They do not all have to be the same length.
 
 An example individual table::
 
-    flags   location
-    0           0.5,1.2
-    0           1.0,3.4
+    flags       location     parents
+    0           0.5,1.2      -1, -1
+    0           1.0,3.4      0, -1
     0
     0           1.2
-    0           3.5,6.3
-    0           0.5,0.5
-    0           0.5
+    0           3.5,6.3      1,2
+    0           0.5,0.5      3,4
+    0           0.5          -1,-1
     0           0.7,0.6,0.0
     0           0.5,0.0
 
@@ -1112,7 +1118,7 @@ The node text format must contain the columns ``is_sample`` and
 <sec_node_table_definition>` for details on these columns.
 
 Note that we do not have a ``flags`` column in the text file format, but
-instead use ``is_sample`` (which may be 0 or 1). Currently, ``IS_SAMPLE`` is
+instead use ``is_sample`` (which may be 0 or 1). Currently, ``NODE_IS_SAMPLE`` is
 the only flag value defined for nodes, and as more flags are defined we will
 allow for extra columns in the text format.
 

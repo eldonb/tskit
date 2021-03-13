@@ -54,7 +54,7 @@ _tskit_module = Extension(
     extra_compile_args=["-std=c99"],
     libraries=libraries,
     define_macros=defines,
-    include_dirs=[libdir, kastore_dir],
+    include_dirs=["lwt_interface", libdir, kastore_dir],
 )
 
 here = os.path.abspath(os.path.dirname(__file__))
@@ -77,16 +77,16 @@ setup(
     author="tskit developers",
     version=tskit_version,
     author_email="admin@tskit.dev",
-    python_requires=">=3.6",
+    python_requires=">=3.7",
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3 :: Only",
     ],
     keywords="tree sequence",
